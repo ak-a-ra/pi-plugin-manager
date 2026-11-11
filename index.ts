@@ -40,6 +40,58 @@ async function runPiCommand(pi: ExtensionAPI, args: string[], cwd: string): Prom
   return result;
 }
 
+/** Resolve the settings.json path for global or project scope. */
+function settingsPath(local: boolean, cwd: string): string {
+  if (local) return cwd + "/.pi/settings.json";
+  const dir = process.env.PI_CODING_AGENT_DIR ?? process.env.HOME + "/.pi/agent";
+  return dir + "/settings.json";
+}
+
+/** Read-modify-write settings.extensions, flipping the leading `-` disable marker. */
+async function toggleExtension(ctx: any, name: string, enable: boolean, local: boolean) {
+  const path = settingsPath(local, ctx.cwd);
+  const scope = local ? "project" : "global";
+
+  let raw: string;
+  try {
+    const readResult = await ctx.executeTool("read", { path });
+    raw = typeof readResult === "string" ? readResult : readResult?.content ?? String(readResult ?? "");
+  } catch (err) {
+    return {
+      content: [{ type: "text", text: `Failed to read ${scope} settings at ${path}: ${err?.message ?? String(err)}` }],
+      isError: true,
+    };
+  }
+
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(raw || "{}");
+  } catch {
+    return { content: [{ type: "text", text: `Invalid JSON in ${scope} settings at ${path}` }], isError: true };
+  }
+
+  const extensions: string[] = (settings.extensions ?? []) as string[];
+  const idx = extensions.findIndex((e: string) => e.replace(/^[-+]/, "").includes(name));
+  if (idx === -1) {
+    return { content: [{ type: "text", text: `Extension "${name}" not found in ${scope} settings` }], isError: true };
+  }
+
+  const stripped = extensions[idx].replace(/^[-+]/, "");
+  extensions[idx] = enable ? stripped : "-" + stripped;
+  settings.extensions = extensions;
+
+  try {
+    await ctx.executeTool("write", { path, content: JSON.stringify(settings, null, 2) });
+  } catch (err) {
+    return {
+      content: [{ type: "text", text: `Failed to write ${scope} settings: ${err?.message ?? String(err)}` }],
+      isError: true,
+    };
+  }
+
+  return { content: [{ type: "text", text: `Extension "${name}" ${enable ? "enabled" : "disabled"} in ${scope} settings` }] };
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "pi_plugin_list",
@@ -115,34 +167,20 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "pi_plugin_enable",
     label: "Enable Pi Plugin",
-    description: "Enable a disabled extension/plugin",
+    description: "Enable a disabled extension/plugin by writing settings.json",
     parameters: EnablePluginInput,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const settings = ctx.getSettings();
-      const scope = params.local ? "project" : "global";
-      const extensions = settings.extensions ?? [];
-      const idx = extensions.findIndex((e: string) => e.includes(params.name));
-      if (idx === -1) {
-        return { content: [{ type: "text", text: `Extension "${params.name}" not found in ${scope} settings` }], isError: true };
-      }
-      return { content: [{ type: "text", text: `Extension "${params.name}" found in ${scope}. Use /config to enable it interactively, or edit settings.json directly.` }] };
+      return toggleExtension(ctx, params.name, true, params.local ?? false);
     },
   });
 
   pi.registerTool({
     name: "pi_plugin_disable",
     label: "Disable Pi Plugin",
-    description: "Disable an extension/plugin",
+    description: "Disable an extension/plugin by writing settings.json",
     parameters: DisablePluginInput,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const settings = ctx.getSettings();
-      const scope = params.local ? "project" : "global";
-      const extensions = settings.extensions ?? [];
-      const idx = extensions.findIndex((e: string) => e.includes(params.name));
-      if (idx === -1) {
-        return { content: [{ type: "text", text: `Extension "${params.name}" not found in ${scope} settings` }], isError: true };
-      }
-      return { content: [{ type: "text", text: `Extension "${params.name}" found in ${scope}. Use /config to disable it interactively, or edit settings.json directly.` }] };
+      return toggleExtension(ctx, params.name, false, params.local ?? false);
     },
   });
 
@@ -168,7 +206,7 @@ export default function (pi: ExtensionAPI) {
     description: "Manage Pi plugins: list, install, remove, update, enable, disable",
     handler: async (args, ctx) => {
       const [subcommand, ...rest] = args.split(/\s+/).filter(Boolean);
-      
+
       if (!subcommand) {
         ctx.ui.notify("Usage: /plugin <list|install|remove|update|enable|disable> [args]", "warning");
         return;
